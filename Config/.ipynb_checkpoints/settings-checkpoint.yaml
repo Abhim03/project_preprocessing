@@ -1,0 +1,57 @@
+# ===========================================================
+# CONFIGURATION GLOBALE DU PIPELINE DE PREPROCESSING
+# ===========================================================
+
+missing_values:
+  drop_threshold: 0.5
+  strategy_numerical: auto
+  strategy_categorical: auto
+  strategy_datetime: auto
+  knn_neighbors: 5
+
+outliers:
+  enabled: true
+  method: auto
+  zscore_threshold: 3.0
+  iqr_multiplier: 1.5
+  isolation_forest_contamination: 0.01
+  action: clip
+
+duplicates:
+  remove: true
+
+encoding:
+  high_cardinality_threshold: 50
+  target_encoding_protection: true
+  ordinal_detection: auto
+  handle_unknown: true
+
+scaling:
+  method: auto
+  minmax_range: [0, 1]
+
+feature_engineering:
+  generate_datetime_features: true
+  generate_interactions: false
+  rare_category_threshold: 0.01
+
+feature_selection:
+  remove_correlated: true
+  correlation_threshold: 0.95
+  variance_threshold: 0.0
+  use_mutual_information: true
+  apply_pca: false
+  pca_variance_ratio: 0.95
+
+split:
+  enabled: true
+  test_size: 0.2
+  shuffle: true
+  stratify: auto
+
+export:
+  save_clean_data: true
+  save_train_test: true
+  save_pipeline: true
+  save_reports: true
+  output_dir: "reports/"
