@@ -26,12 +26,15 @@ from preprocessing.cleaner.duplicates_handler import DuplicatesHandler
 from preprocessing.cleaner.inconsistent_values_handler import InconsistentValuesHandler
 from preprocessing.cleaner.missing_values_handler import MissingValuesHandler
 from preprocessing.cleaner.outlier_handler import OutlierHandler
+from preprocessing.cleaner.text_cleaner import TextCleaner
+from preprocessing.cleaner.custom_rules import CustomRulesCleaner
 
 # Transformer
 from preprocessing.transformer.encoders import Encoders
 from preprocessing.transformer.scalers import Scalers
 from preprocessing.transformer.feature_generator import FeatureGenerator
 from preprocessing.transformer.feature_selector import FeatureSelector
+from preprocessing.transformer.category_grouper import CategoryGrouper
 
 # Visualizer
 from preprocessing.visualizer.distribution_plots import DistributionPlots
@@ -41,44 +44,75 @@ from preprocessing.visualizer.missing_values_plots import MissingValuesPlots
 # Validator
 from preprocessing.validator.data_validation import DataValidator
 
+# Validator
+from preprocessing.report.notebook_generator import NotebookGenerator
+
 
 class PreprocessingPipeline:
     """
     Pipeline de préprocessing complet, de la lecture des données
     jusqu'au train/test split et à l'export.
+
+    Étapes :
+      1. Chargement & inférence de schéma
+      2. EDA + rapports + visualisations
+      3. Cleaning (doublons, incohérences, NaN, outliers)
+      4. Text cleaning + règles custom + grouping catégories rares
+      5. Feature engineering (nouvelles features)
+      6. Encodage des variables catégorielles
+      7. Scaling des variables numériques
+      8. Feature selection (variance, corrélation, MI, modèle, PCA)
+      9. Validation finale
+     10. Train/Test split
+     11. Exports (CSV, rapport JSON, pipeline pickle)
     """
 
     def __init__(self, config_path: str = "config/settings.yaml"):
         # Charger la configuration
         self.config = load_config(config_path)
 
-        # Modules
+        # Modules Reader
         self.file_loader = FileLoader()
         self.schema_inference = SchemaInference()
+
+        # Modules Analyzer
         self.type_detector = TypeDetector()
         self.data_summary = DataSummary()
         self.missing_analyzer = MissingValuesAnalyzer(self.config)
         self.outlier_detector = OutlierDetector(self.config)
 
+        # Modules Cleaner
         self.duplicates_handler = DuplicatesHandler(self.config)
         self.inconsistent_handler = InconsistentValuesHandler()
         self.missing_handler = MissingValuesHandler(self.config)
         self.outlier_handler = OutlierHandler(self.config)
+        self.text_cleaner = TextCleaner(self.config)
+        self.custom_rules_cleaner = CustomRulesCleaner(self.config)
+        self.category_grouper = CategoryGrouper(self.config)
 
+        # Modules Transformer
         self.encoders = Encoders(self.config)
         self.scalers = Scalers(self.config)
         self.feature_generator = FeatureGenerator(self.config)
         self.feature_selector = FeatureSelector(self.config)
 
+        # Visualisation
         self.dist_plots = DistributionPlots()
         self.corr_plots = CorrelationsPlots()
         self.missing_plots = MissingValuesPlots()
 
+        # Validation
         self.validator = DataValidator()
 
-        # Sous-configs
+        # Sous-configs utiles
         self.split_config = self.config.get("split", {})
         self.export_config = self.config.get("export", {})
+
+        self.text_cfg = self.config.get("text_cleaning", {})
+        self.rules_cfg = self.config.get("custom_rules", {})
+        self.group_cfg = self.config.get("categorical_grouper", {})
+
+        # Dossier de sortie
         self.output_dir = self.export_config.get("output_dir", "reports/")
         ensure_directory(self.output_dir)
 
@@ -92,7 +126,7 @@ class PreprocessingPipeline:
         missing_report = self.missing_analyzer.analyze(df, schema)
         outlier_report = self.outlier_detector.analyze(df, schema)
 
-        # Plots
+        # Plots (on ignore les erreurs pour ne pas bloquer le pipeline)
         try:
             self.dist_plots.apply(df, schema)
             self.corr_plots.apply(df, schema)
@@ -113,7 +147,7 @@ class PreprocessingPipeline:
         missing_report: dict,
         outlier_report: dict,
     ) -> pd.DataFrame:
-        """Applique toutes les étapes de cleaning."""
+        """Applique toutes les étapes de cleaning de base."""
         log("=== Étape CLEANING ===")
 
         # 1. Doublons
@@ -134,8 +168,51 @@ class PreprocessingPipeline:
 
         return df
 
+    def _apply_text_cleaning_and_rules(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Applique le text cleaning + règles custom si activés."""
+        df_res = df.copy()
+
+        # ----- Text cleaning -----
+        if self.text_cfg.get("enable", False):
+            text_columns = self.text_cfg.get("text_columns", [])
+            if not text_columns:
+                text_columns = [
+                    col for col in df_res.columns if df_res[col].dtype == "object"
+                ]
+            if text_columns:
+                log(f"Text cleaning appliqué sur colonnes : {text_columns}")
+                df_res = self.text_cleaner.apply(df_res, text_columns)
+
+        # ----- Règles custom -----
+        if self.rules_cfg.get("enable", False):
+            rules = self.rules_cfg.get("rules", {})
+            if rules:
+                log(f"Règles custom appliquées : {rules}")
+                df_res = self.custom_rules_cleaner.apply(df_res, rules)
+
+        return df_res
+
+    def _apply_categorical_grouping(
+        self, df: pd.DataFrame, schema: dict
+    ) -> pd.DataFrame:
+        """Regroupe les catégories rares (avant encodage) si activé."""
+        if not self.group_cfg.get("enable", False):
+            return df
+
+        df_res = df.copy()
+        cat_cols = self.group_cfg.get("categorical_columns", [])
+        if not cat_cols:
+            cat_cols = [col for col, t in schema.items() if t == "categorical"]
+
+        if not cat_cols:
+            return df_res
+
+        log(f"Grouping des catégories rares sur colonnes : {cat_cols}")
+        df_res = self.category_grouper.apply(df_res, cat_cols)
+        return df_res
+
     def _split_train_test(self, X: pd.DataFrame, y: pd.Series):
-        """Split train/test intelligent avec stratification automatique."""
+        """Split train/test avec stratification automatique si approprié."""
         if not self.split_config.get("enabled", True) or y is None:
             log("Train/test split désactivé ou target absente.")
             return None
@@ -187,7 +264,7 @@ class PreprocessingPipeline:
         X_test=None,
         y_train=None,
         y_test=None,
-        eda_report: dict = None,
+        eda_report: dict | None = None,
     ):
         """Gère tous les exports en CSV/JSON + pipeline pickle."""
         ensure_directory(self.output_dir)
@@ -210,7 +287,7 @@ class PreprocessingPipeline:
             y_test.to_csv(os.path.join(self.output_dir, "y_test.csv"), index=False)
             log("Train/test exportés dans le dossier reports/.")
 
-        # 3. Rapport de preprocessing (EDA + NaN + outliers)
+        # 3. Rapport de preprocessing (EDA + NaN + outliers + validation)
         if self.export_config.get("save_reports", True) and eda_report is not None:
             report_path = os.path.join(self.output_dir, "preprocessing_report.json")
             with open(report_path, "w", encoding="utf-8") as f:
@@ -280,12 +357,18 @@ class PreprocessingPipeline:
         )
 
         # --------------------------------------------------------------
-        # 5. Feature engineering (nouvelles colonnes)
+        # 5. Text cleaning + règles custom + grouping catégories
+        # --------------------------------------------------------------
+        df_clean = self._apply_text_cleaning_and_rules(df_clean)
+        df_clean = self._apply_categorical_grouping(df_clean, refined_schema)
+
+        # --------------------------------------------------------------
+        # 6. Feature engineering (nouvelles colonnes)
         # --------------------------------------------------------------
         df_features = self.feature_generator.apply(df_clean, refined_schema)
 
         # --------------------------------------------------------------
-        # 6. Séparation X / y
+        # 7. Séparation X / y
         # --------------------------------------------------------------
         if target_col is not None and target_col in df_features.columns:
             y = df_features[target_col]
@@ -295,58 +378,88 @@ class PreprocessingPipeline:
             X = df_features
 
         # --------------------------------------------------------------
-        # 7. Encodage des variables catégorielles
+        # 8. Encodage des variables catégorielles
         # --------------------------------------------------------------
         X_encoded = self.encoders.apply(X, refined_schema, y)
 
         # --------------------------------------------------------------
-        # 8. Scaling
+        # 9. Scaling
         # --------------------------------------------------------------
         scaling_schema = self._build_scaling_schema(X_encoded)
         X_scaled = self.scalers.apply(X_encoded, scaling_schema)
 
         # --------------------------------------------------------------
-        # 9. Feature selection
+        # 10. Feature selection
         # --------------------------------------------------------------
         X_final = self.feature_selector.apply(X_scaled, scaling_schema, y)
 
         # --------------------------------------------------------------
-        # 10. Validation finale des données
+        # 11. Validation finale des données
         # --------------------------------------------------------------
         to_validate = X_final.copy()
-        if y is not None:
+        if y is not None and target_col is not None:
             to_validate[target_col] = y
 
         validation_report = self.validator.validate(to_validate, scaling_schema)
         eda_report["validation_report"] = validation_report
 
         # --------------------------------------------------------------
-        # 11. Train/test split (si y dispo)
+        # 12. Train/test split (si y dispo)
         # --------------------------------------------------------------
         split_result = None
         if y is not None:
             split_result = self._split_train_test(X_final, y)
 
-        # --------------------------------------------------------------
-        # 12. Exports
-        # --------------------------------------------------------------
-        if split_result is not None:
-            X_train, X_test, y_train, y_test = split_result
-            self._export_outputs(
-                df_clean=df_clean,
-                X_train=X_train,
-                X_test=X_test,
-                y_train=y_train,
-                y_test=y_test,
-                eda_report=eda_report,
-            )
-            log("=== FIN DU PIPELINE (avec target) ===")
-            return X_train, X_test, y_train, y_test
+       # --------------------------------------------------------------
+# 13. Exports + Notebook Generation
+# --------------------------------------------------------------
+results = {
+    "df_raw": df_raw,
+    "df_clean": df_clean,
+    "df_features": df_features,
+    "X_encoded": X_encoded,
+    "X_scaled": X_scaled,
+    "X_final": X_final,
+    "y": y,
+    "schema": refined_schema,
+    "eda_report": eda_report,
+    "split": split_result
+}
 
-        else:
-            self._export_outputs(
-                df_clean=df_clean,
-                eda_report=eda_report,
-            )
-            log("=== FIN DU PIPELINE (sans target) ===")
-            return X_final
+# Avec target
+if split_result is not None:
+    X_train, X_test, y_train, y_test = split_result
+
+    self._export_outputs(
+        df_clean=df_clean,
+        X_train=X_train,
+        X_test=X_test,
+        y_train=y_train,
+        y_test=y_test,
+        eda_report=eda_report,
+    )
+
+    # --- Génération du Notebook automatique ---
+    NotebookGenerator().generate_notebook(
+        results,
+        output_path=os.path.join(self.output_dir, "preprocessing_report.ipynb")
+    )
+
+    log("=== FIN DU PIPELINE (avec target) ===")
+    return X_train, X_test, y_train, y_test
+
+# Sans target
+else:
+    self._export_outputs(
+        df_clean=df_clean,
+        eda_report=eda_report,
+    )
+
+    # --- Génération du Notebook automatique ---
+    NotebookGenerator().generate_notebook(
+        results,
+        output_path=os.path.join(self.output_dir, "preprocessing_report.ipynb")
+    )
+
+    log("=== FIN DU PIPELINE (sans target) ===")
+    return X_final
