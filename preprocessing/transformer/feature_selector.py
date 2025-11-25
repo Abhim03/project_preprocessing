@@ -1,74 +1,122 @@
 import pandas as pd
 import numpy as np
-from sklearn.feature_selection import VarianceThreshold, mutual_info_regression, mutual_info_classif
+from sklearn.feature_selection import (
+    VarianceThreshold,
+    mutual_info_regression,
+    mutual_info_classif,
+)
 from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from preprocessing.utils import log
 
 
 class FeatureSelector:
     """
-    Sélection automatique de features :
-    - suppression colonnes constantes / quasi-constantes
-    - suppression colonnes très corrélées
-    - seuil de variance
-    - mutual information
-    - PCA (optionnel)
+    Sélection avancée de features :
+    - constantes et quasi-constantes
+    - colonnes dupliquées
+    - variance threshold
+    - corrélation forte intelligente
+    - mutual information améliorée
+    - sélection via modèles (RF)
+    - PCA optionnelle
     """
 
     def __init__(self, config):
         self.config = config["feature_selection"]
-        self.pca_model = None
-        self.selected_features = None
 
-    # ----------------------------------------------------------------------
-    # 1. Constantes
-    # ----------------------------------------------------------------------
+        self.selected_features = None
+        self.pca_model = None
+        self.model_selector = None
+
+    # -----------------------------------------------------------
+    # 1. Colonnes constantes
+    # -----------------------------------------------------------
     def _remove_constant(self, df):
-        constants = [col for col in df.columns if df[col].nunique() <= 1]
+        constants = [col for col in df if df[col].nunique() <= 1]
         if constants:
             log(f"Colonnes constantes supprimées : {constants}")
             df = df.drop(columns=constants)
         return df
 
-    # ----------------------------------------------------------------------
-    # 2. VarianceThreshold
-    # ----------------------------------------------------------------------
+    # -----------------------------------------------------------
+    # 2. Colonnes quasi-constantes
+    # -----------------------------------------------------------
+    def _remove_near_constant(self, df):
+        threshold = self.config.get("near_constant_threshold", 0.995)
+        to_drop = []
+        for col in df.columns:
+            freq = df[col].value_counts(normalize=True, dropna=False).max()
+            if freq >= threshold:
+                to_drop.append(col)
+
+        if to_drop:
+            log(f"Colonnes quasi-constantes supprimées : {to_drop}")
+            df = df.drop(columns=to_drop)
+
+        return df
+
+    # -----------------------------------------------------------
+    # 3. Colonnes dupliquées
+    # -----------------------------------------------------------
+    def _remove_duplicates(self, df):
+        duplicates = []
+        seen = {}
+        for col in df.columns:
+            data = tuple(df[col].fillna(-999).values)
+            if data in seen:
+                duplicates.append(col)
+            else:
+                seen[data] = col
+
+        if duplicates:
+            log(f"Colonnes dupliquées supprimées : {duplicates}")
+            df = df.drop(columns=duplicates)
+
+        return df
+
+    # -----------------------------------------------------------
+    # 4. Variance threshold
+    # -----------------------------------------------------------
     def _apply_variance_threshold(self, df):
         threshold = self.config["variance_threshold"]
         if threshold <= 0:
             return df
 
-        selector = VarianceThreshold(threshold=threshold)
+        selector = VarianceThreshold(threshold)
         selector.fit(df)
 
         kept = df.columns[selector.get_support()]
-        removed = [c for c in df.columns if c not in kept]
+        drop = [c for c in df.columns if c not in kept]
 
-        if removed:
-            log(f"Colonnes supprimées (variance faible) : {removed}")
+        if drop:
+            log(f"Variance faible -> supprimées : {drop}")
 
         return df[kept]
 
-    # ----------------------------------------------------------------------
-    # 3. Corrélation forte
-    # ----------------------------------------------------------------------
+    # -----------------------------------------------------------
+    # 5. Correlation forte
+    # -----------------------------------------------------------
     def _remove_high_correlation(self, df):
-        threshold = self.config["correlation_threshold"]
+        thr = self.config["correlation_threshold"]
 
         corr = df.corr().abs()
-        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        upper = corr.where(np.triu(np.ones(corr.shape), 1).astype(bool))
 
-        to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
+        drop = []
+        for col in upper.columns:
+            if any(upper[col] > thr):
+                drop.append(col)
 
-        if to_drop:
-            log(f"Colonnes supprimées (corrélation > {threshold}) : {to_drop}")
-            df = df.drop(columns=to_drop)
+        if drop:
+            log(f"Colonnes supprimées (corrélation > {thr}) : {drop}")
+            df = df.drop(columns=drop)
 
         return df
 
-    # ----------------------------------------------------------------------
-    # 4. Mutual Information (numérique + cat)
-    # ----------------------------------------------------------------------
+    # -----------------------------------------------------------
+    # 6. Mutual Information améliorée
+    # -----------------------------------------------------------
     def _apply_mutual_information(self, df, y):
         try:
             if y.nunique() < 20:
@@ -76,82 +124,128 @@ class FeatureSelector:
             else:
                 mi = mutual_info_regression(df, y)
 
-            mi_series = pd.Series(mi, index=df.columns)
-            threshold = mi_series.quantile(0.05)  # garder 95% des features informatives
+            mi = pd.Series(mi, index=df.columns)
 
-            selected = mi_series[mi_series >= threshold].index
-            removed = mi_series[mi_series < threshold].index
+            threshold = mi.quantile(self.config["mi_quantile"])
+            kept = mi[mi >= threshold].index
+            drop = mi[mi < threshold].index
 
-            if len(removed) > 0:
-                log(f"Colonnes supprimées par mutual information : {list(removed)}")
+            log(f"MI -> gardés : {len(kept)}, supprimés : {list(drop)}")
 
-            return df[selected]
-        except Exception:
-            log("Mutual information ignorée (erreur ou données inadaptées).")
+            return df[kept]
+
+        except Exception as e:
+            log(f"MI ignorée (erreur={e})")
             return df
 
-    # ----------------------------------------------------------------------
-    # 5. PCA optionnelle
-    # ----------------------------------------------------------------------
+    # -----------------------------------------------------------
+    # 7. Sélection via modèles
+    # -----------------------------------------------------------
+    def _model_based_selection(self, df, y):
+        if not self.config.get("use_model_selection", False):
+            return df
+
+        log("Sélection par importance modèle…")
+
+        # On utilise RandomForest pour obtenir importances
+        if y.nunique() < 20:
+            model = RandomForestClassifier(n_estimators=200, n_jobs=-1, random_state=42)
+        else:
+            model = RandomForestRegressor(n_estimators=200, n_jobs=-1, random_state=42)
+
+        model.fit(df, y)
+        importances = pd.Series(model.feature_importances_, index=df.columns)
+
+        thr = importances.quantile(self.config["model_importance_quantile"])
+
+        kept = importances[importances >= thr].index
+        drop = importances[importances < thr].index
+
+        log(f"Model-selection -> gardés : {len(kept)}, supprimés : {list(drop[:10])}...")
+
+        self.model_selector = model
+        return df[kept]
+
+    # -----------------------------------------------------------
+    # 8. PCA
+    # -----------------------------------------------------------
     def _apply_pca(self, df):
         if not self.config["apply_pca"]:
             return df
 
-        variance_ratio = self.config["pca_variance_ratio"]
+        ratio = self.config["pca_variance_ratio"]
 
-        pca = PCA(n_components=variance_ratio)
-        transformed = pca.fit_transform(df)
+        try:
+            pca = PCA(n_components=ratio)
+            transformed = pca.fit_transform(df)
 
-        self.pca_model = pca
+            cols = [f"PC{i+1}" for i in range(transformed.shape[1])]
+            df_pca = pd.DataFrame(transformed, index=df.index, columns=cols)
 
-        cols = [f"PC{i+1}" for i in range(transformed.shape[1])]
-        df_pca = pd.DataFrame(transformed, columns=cols, index=df.index)
+            self.pca_model = pca
 
-        log(f"PCA appliquée : {transformed.shape[1]} composants conservés")
+            log(f"PCA appliquée -> {df_pca.shape[1]} composants")
 
-        return df_pca
+            return df_pca
+        except Exception as e:
+            log(f"PCA ignorée (erreur={e})")
+            return df
 
-    # ----------------------------------------------------------------------
-    # MÉTHODE PRINCIPALE
-    # ----------------------------------------------------------------------
+    # -----------------------------------------------------------
+    # MAIN METHOD
+    # -----------------------------------------------------------
     def apply(self, df, schema, y=None):
-        log("Sélection automatique des features...")
+        log("=== Sélection des features ===")
 
-        df_fs = df.copy()
+        df_sel = df.copy()
 
-        numeric_df = df_fs.select_dtypes(include=[np.number])
+        # On ne garde que les colonnes numériques
+        df_num = df_sel.select_dtypes(include=[np.number])
 
-        # Step 1 : remove constant columns
-        numeric_df = self._remove_constant(numeric_df)
+        # 1. Constantes
+        df_num = self._remove_constant(df_num)
 
-        # Step 2 : variance threshold
-        numeric_df = self._apply_variance_threshold(numeric_df)
+        # 2. Quasi-constantes
+        if self.config["remove_near_constant"]:
+            df_num = self._remove_near_constant(df_num)
 
-        # Step 3 : high correlation
+        # 3. Dupliquées
+        if self.config["remove_duplicates"]:
+            df_num = self._remove_duplicates(df_num)
+
+        # 4. Variance
+        df_num = self._apply_variance_threshold(df_num)
+
+        # 5. Corrélation
         if self.config["remove_correlated"]:
-            numeric_df = self._remove_high_correlation(numeric_df)
+            df_num = self._remove_high_correlation(df_num)
 
-        # Step 4 : mutual information
+        # 6. Mutual Information
         if self.config["use_mutual_information"] and y is not None:
-            numeric_df = self._apply_mutual_information(numeric_df, y)
+            df_num = self._apply_mutual_information(df_num, y)
 
-        # Step 5 : PCA (optional)
-        numeric_df = self._apply_pca(numeric_df)
+        # 7. Model-based selection
+        if self.config["use_model_selection"] and y is not None:
+            df_num = self._model_based_selection(df_num, y)
 
-        # Conserver les colonnes sélectionnées
-        self.selected_features = numeric_df.columns.tolist()
+        # 8. PCA
+        df_num = self._apply_pca(df_num)
 
-        log("Sélection des features terminée.")
-        return numeric_df
+        # Sauvegarde des features
+        self.selected_features = df_num.columns.tolist()
 
-    # ----------------------------------------------------------------------
-    # Pour transformer un test set
-    # ----------------------------------------------------------------------
+        log("=== Sélection terminée ===")
+        return df_num
+
+    # -----------------------------------------------------------
+    # Transform test set
+    # -----------------------------------------------------------
     def transform(self, df):
+        # PCA
         if self.pca_model is not None:
             transformed = self.pca_model.transform(df.values)
             cols = [f"PC{i+1}" for i in range(transformed.shape[1])]
-            return pd.DataFrame(transformed, columns=cols, index=df.index)
+            return pd.DataFrame(transformed, index=df.index, columns=cols)
 
-        # Sinon simplement garder les mêmes colonnes
+        # Sinon simplement garder les colonnes sélectionnées
         return df[self.selected_features]

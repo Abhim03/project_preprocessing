@@ -1,57 +1,140 @@
-# ===========================================================
-# CONFIGURATION GLOBALE DU PIPELINE DE PREPROCESSING
-# ===========================================================
+# ===============================================================
+#                  GLOBAL PREPROCESSING SETTINGS
+# ===============================================================
 
-missing_values:
-  drop_threshold: 0.5
-  strategy_numerical: auto
-  strategy_categorical: auto
-  strategy_datetime: auto
-  knn_neighbors: 5
+general:
+  random_state: 42
+  verbosity: 1
 
-outliers:
-  enabled: true
-  method: auto
-  zscore_threshold: 3.0
-  iqr_multiplier: 1.5
-  isolation_forest_contamination: 0.01
-  action: clip
+# ===============================================================
+#                            READER
+# ===============================================================
 
-duplicates:
-  remove: true
+reader:
+  allowed_extensions: [".csv", ".xlsx", ".parquet", ".json"]
+  encoding: "utf-8"
+
+# ===============================================================
+#                            CLEANING
+# ===============================================================
+
+cleaning:
+  missing_values:
+    strategy_numeric: "mean"        # mean / median / knn
+    strategy_categorical: "most_frequent"  # most_frequent / new_category
+    add_missing_indicators: true
+
+  outliers:
+    method: "iqr"                   # iqr / zscore / isolation_forest
+    iqr_factor: 1.5
+    zscore_threshold: 4
+    isolation_forest_contamination: 0.02
+
+  duplicates:
+    remove_duplicates: true
+
+  inconsistencies:
+    enable_fixing: true
+
+# ===============================================================
+#                            ENCODING
+# ===============================================================
 
 encoding:
-  high_cardinality_threshold: 50
-  target_encoding_protection: true
-  ordinal_detection: auto
-  handle_unknown: true
+
+  # AUTO CHOICE LOGIC
+  categorical_strategy: "auto"       # auto / onehot / target / hashing
+  max_categories_for_onehot: 12
+  high_cardinality_threshold: 40
+
+  # HASHING
+  hashing_features: 10
+
+  # TARGET ENCODING
+  target_encoder:
+    smoothing: 1.0
+
+# ===============================================================
+#                            SCALING
+# ===============================================================
 
 scaling:
-  method: auto
+  method: "auto"                    # auto / standard / minmax / robust / power / log
   minmax_range: [0, 1]
+  enable_log_for_extreme_skew: true
+
+# ===============================================================
+#                     FEATURE ENGINEERING
+# ===============================================================
 
 feature_engineering:
+
+  # Cleanup
+  remove_near_constant: true
+  near_constant_threshold: 0.995
+
+  # Datetime features
   generate_datetime_features: true
-  generate_interactions: false
+
+  # Rare category grouping
   rare_category_threshold: 0.01
 
+  # Numeric transforms
+  enable_log_transform: true
+  enable_power_transform: true
+  enable_binning: true
+
+  # Categorical interactions
+  generate_cross_categorical: true
+
+  # Numeric interactions
+  generate_interactions: true
+
+  # Polynomial features
+  generate_polynomials: false
+
+# ===============================================================
+#                      FEATURE SELECTION
+# ===============================================================
+
 feature_selection:
-  remove_correlated: true
-  correlation_threshold: 0.95
+
+  # Simple filters
   variance_threshold: 0.0
+  remove_near_constant: true
+  remove_duplicates: true
+  remove_correlated: true
+  correlation_threshold: 0.90
+
+  # Mutual Information
   use_mutual_information: true
+  mi_quantile: 0.05   # remove bottom 5%
+
+  # Model-based selection
+  use_model_selection: true
+  model_importance_quantile: 0.20
+
+  # PCA
   apply_pca: false
   pca_variance_ratio: 0.95
 
+# ===============================================================
+#                        TRAIN / TEST SPLIT
+# ===============================================================
+
 split:
   enabled: true
-  test_size: 0.2
+  test_size: 0.20
   shuffle: true
-  stratify: auto
+  stratify: "auto"
+
+# ===============================================================
+#                            EXPORT
+# ===============================================================
 
 export:
+  output_dir: "reports/"
   save_clean_data: true
   save_train_test: true
-  save_pipeline: true
   save_reports: true
-  output_dir: "reports/"
+  save_pipeline: true

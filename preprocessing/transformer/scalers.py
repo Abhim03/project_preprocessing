@@ -1,119 +1,164 @@
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, PowerTransformer
+from sklearn.preprocessing import (
+    StandardScaler,
+    MinMaxScaler,
+    RobustScaler,
+    PowerTransformer,
+)
 from preprocessing.utils import log
 
 
 class Scalers:
     """
-    Applique le scaling automatique des colonnes numériques.
-    Méthodes possibles :
-    - StandardScaler
-    - MinMaxScaler
-    - PowerTransformer (Yeo-Johnson)
-    - Log transform (cas spécifiques)
+    Scaling intelligent basé sur :
+    - skewness
+    - présence d'outliers
+    - variance / range
+    - paramètres settings.yaml
 
-    La méthode choisie dépend :
-    - skewness de la colonne
-    - paramètres dans settings.yaml
+    Méthodes possibles :
+    - standard
+    - minmax
+    - robust
+    - power (yeo-johnson)
+    - log (cas skewness extrême)
+
+    La logique auto sélectionne le meilleur scaler pour chaque feature.
     """
 
     def __init__(self, config):
         self.config = config["scaling"]
 
-        # stocker les scalers pour la transformation du test set
+        # Pour réappliquer les bons scalers sur test
         self.scalers = {}
 
     # ----------------------------------------------------------------------
-    # Sélection automatique selon la distribution
+    # UTILITAIRES INTELLIGENTS
     # ----------------------------------------------------------------------
-    def _select_method(self, skewness):
+
+    def _has_outliers(self, series):
+        """Détecte les outliers via règle IQR."""
+        q1 = series.quantile(0.25)
+        q3 = series.quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        outliers = ((series < lower) | (series > upper)).sum()
+        return outliers > 0
+
+    def _is_skewed(self, skewness):
+        """Détecte si la variable est très skewed."""
+        return abs(skewness) > 1.0
+
+    # LOGIQUE DE CHOIX
+    def _choose_method(self, series):
         if self.config["method"] != "auto":
             return self.config["method"]
 
-        # Skewness forte -> PowerTransformer
-        if abs(skewness) > 1:
+        skew = float(series.skew())
+        outliers = self._has_outliers(series)
+
+        # Cas extrême → log transform
+        if abs(skew) > 2.5:
+            return "log"
+
+        # Skewness importante → power transformer
+        if self._is_skewed(skew):
             return "power"
 
-        # Skewness légère -> MinMax
-        if abs(skewness) > 0.5:
+        # Outliers → RobustScaler
+        if outliers:
+            return "robust"
+
+        # Si plage très différente (minmax recommandé)
+        if series.min() < 0 or series.max() > 1e3:
             return "minmax"
 
+        # Default
         return "standard"
 
     # ----------------------------------------------------------------------
-    # Application scaling sur une colonne
+    # APPLY SUR TRAIN
     # ----------------------------------------------------------------------
+
     def _scale_column(self, df, col, method):
-        series = df[col]
+        values = df[col].astype(float)
 
         if method == "log":
-            df[col] = np.log1p(series.clip(lower=0))
-            return None  # no scaler needed
+            # log(1+x) pour positivité
+            df[col] = np.log1p(values.clip(lower=0))
+            return None
 
         elif method == "standard":
             scaler = StandardScaler()
-            df[col] = scaler.fit_transform(series.values.reshape(-1, 1))
+            df[col] = scaler.fit_transform(values.to_numpy().reshape(-1, 1))
             return scaler
 
         elif method == "minmax":
-            scaler = MinMaxScaler(feature_range=self.config["minmax_range"])
-            df[col] = scaler.fit_transform(series.values.reshape(-1, 1))
+            scaler = MinMaxScaler(
+                feature_range=self.config.get("minmax_range", (0, 1))
+            )
+            df[col] = scaler.fit_transform(values.to_numpy().reshape(-1, 1))
+            return scaler
+
+        elif method == "robust":
+            scaler = RobustScaler()
+            df[col] = scaler.fit_transform(values.to_numpy().reshape(-1, 1))
             return scaler
 
         elif method == "power":
             scaler = PowerTransformer(method="yeo-johnson")
-            df[col] = scaler.fit_transform(series.values.reshape(-1, 1))
+            df[col] = scaler.fit_transform(values.to_numpy().reshape(-1, 1))
             return scaler
 
-        else:
-            # fallback
-            scaler = StandardScaler()
-            df[col] = scaler.fit_transform(series.values.reshape(-1, 1))
-            return scaler
+        # fallback
+        scaler = StandardScaler()
+        df[col] = scaler.fit_transform(values.to_numpy().reshape(-1, 1))
+        return scaler
 
-    # ----------------------------------------------------------------------
-    # Méthode principale (train)
-    # ----------------------------------------------------------------------
     def apply(self, df, schema):
-        log("Début du scaling numérique...")
+        log("=== Début du scaling intelligent ===")
 
         df_scaled = df.copy()
 
         for col in df.columns:
-
             if schema[col] != "numerical":
                 continue
 
             series = df[col].dropna()
-
             if series.nunique() <= 1:
-                continue  # pas besoin de scaler
+                continue
 
-            skewness = float(series.skew())
-            method = self._select_method(skewness)
+            method = self._choose_method(series)
 
-            log(f"Colonne '{col}' -> method: {method} (skewness = {skewness:.3f})")
+            log(
+                f"Colonne '{col}' | skew={series.skew():.3f} | "
+                f"method={method}"
+            )
 
             scaler = self._scale_column(df_scaled, col, method)
 
             if scaler is not None:
                 self.scalers[col] = scaler
 
-        log("Scaling terminé.")
+        log("=== Scaling terminé ===")
         return df_scaled
 
     # ----------------------------------------------------------------------
-    # Méthode pour scaler test set
+    # TRANSFORM SUR TEST
     # ----------------------------------------------------------------------
+
     def transform(self, df):
-        log("Application du scaling sur test set...")
+        log("Application scaling sur test set...")
 
         df_scaled = df.copy()
 
         for col, scaler in self.scalers.items():
             if col in df_scaled:
-                df_scaled[col] = scaler.transform(df_scaled[col].values.reshape(-1, 1))
+                df_scaled[col] = scaler.transform(
+                    df_scaled[col].values.reshape(-1, 1)
+                )
 
         log("Scaling test set terminé.")
         return df_scaled
